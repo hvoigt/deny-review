@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# Prerequisites: Bash 4+, GitHub CLI (gh), jq
+
+# Configuration
+ORG="<org>"
+TEAM="<team>"
+REVIEW_MESSAGE="Someone else has to approve"
+
+# Repositories to check (space-separated list)
+# Leave empty to check all repositories
+MONITORED_REPOS="<org/repo1> <org/repo2>"
+
+if [ ! -f ~/.config/deny-review/config ]; then
+  echo "Please create a config file at ~/.config/deny-review/config with your settings."
+  echo "Example content:"
+  echo "ORG=\"my-org\""
+  echo "TEAM=\"my-team\""
+  echo "REVIEW_MESSAGE=\"Someone else has to approve\""
+  echo "MONITORED_REPOS=\"my-org/repo1 my-org/repo2\""
+  exit 1
+fi
+
+source ~/.config/deny-review/config
+
+# Cache for team membership checks
+declare -A TEAM_MEMBERSHIP_CACHE
+
+# Function to check if a user is a member of a team
+is_team_member() {
+  local username="$1"
+  local org="$2"
+  local team="$3"
+  local cache_key="${org}:${team}:${username}"
+
+  # Check if result is cached
+  if [[ -v TEAM_MEMBERSHIP_CACHE[$cache_key] ]]; then
+    return ${TEAM_MEMBERSHIP_CACHE[$cache_key]}
+  fi
+
+  # Check team membership via GitHub API
+  gh api "/orgs/${org}/teams/${team}/memberships/${username}" --silent 2>/dev/null
+  local result=$?
+
+  # Cache the result
+  TEAM_MEMBERSHIP_CACHE[$cache_key]=$result
+
+  return $result
+}
+
+# Function to check if repository is in monitored list
+should_monitor_repo() {
+  local repo="$1"
+
+  # If MONITORED_REPOS is empty, monitor all repos
+  if [ -z "$MONITORED_REPOS" ]; then
+    return 0
+  fi
+
+  # Check if repo is in the list
+  for monitored in $MONITORED_REPOS; do
+    if [ "$repo" = "$monitored" ]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Function to process a single PR
+process_pr() {
+  local pr_url="$1"
+  local pr_author="$2"
+  local pr_repo="$3"
+
+  echo "Processing PR: $pr_url"
+  echo "  Author: $pr_author"
+  echo "  Repo: $pr_repo"
+
+  # Check if we should monitor this repo
+  if ! should_monitor_repo "$pr_repo"; then
+    echo "  Skipping: Repository not in monitored list"
+    return 0
+  fi
+
+  # Check if author is a team member
+  if is_team_member "$pr_author" "$ORG" "$TEAM"; then
+    echo "  Skipping: Author is a member of team ${TEAM}"
+    return 0
+  fi
+
+  # Author is not a team member, deny the review
+  echo "  Denying review: Author is not a member of team ${TEAM}"
+  gh pr review -c -b "$REVIEW_MESSAGE" "$pr_url"
+
+  if [ $? -eq 0 ]; then
+    echo "  ✓ Review denied successfully"
+  else
+    echo "  ✗ Failed to deny review"
+  fi
+}
+
+# Main script
+main() {
+  # If a PR URL is provided, process just that one
+  if [ -n "$1" ]; then
+    echo "Processing single PR: $1"
+
+    # Get PR details
+    pr_json=$(gh pr view "$1" --json author,repository)
+    pr_author=$(echo "$pr_json" | jq -r '.author.login')
+    pr_repo=$(echo "$pr_json" | jq -r '.repository.nameWithOwner')
+
+    process_pr "$1" "$pr_author" "$pr_repo"
+    exit 0
+  fi
+
+  # Otherwise, process all review requests
+  echo "Fetching all review requests for @me..."
+
+  # Get all PRs where review is requested
+  prs=$(gh search prs --review-requested=@me --state=open --json url,author,repository --limit 100)
+
+  # Check if we got any PRs
+  pr_count=$(echo "$prs" | jq 'length')
+
+  if [ "$pr_count" -eq 0 ]; then
+    echo "No review requests found."
+    exit 0
+  fi
+
+  echo "Found $pr_count review request(s)"
+  echo ""
+
+  # Process each PR
+  echo "$prs" | jq -c '.[]' | while read -r pr; do
+    pr_url=$(echo "$pr" | jq -r '.url')
+    pr_author=$(echo "$pr" | jq -r '.author.login')
+    pr_repo=$(echo "$pr" | jq -r '.repository.nameWithOwner')
+
+    process_pr "$pr_url" "$pr_author" "$pr_repo"
+    echo ""
+  done
+
+  echo "Done processing all review requests."
+}
+
+# Run main function
+main "$@"
