@@ -123,13 +123,26 @@ process_pr() {
     return 0
   fi
 
-  # Check if author is a team member
-  if is_team_member "$pr_author" "$ORG" "$TEAM"; then
-    echo "  Skipping: Author is a member of team ${TEAM}"
+  # Check if author is a member of a child team (deny these too)
+  if is_child_team_member "$pr_author" "$ORG" "$TEAM"; then
+    echo "  Denying review: Author is a member of a child team of ${TEAM}"
+    gh pr review -c -b "$REVIEW_MESSAGE" "$pr_url"
+
+    if [ $? -eq 0 ]; then
+      echo "  ✓ Review denied successfully"
+    else
+      echo "  ✗ Failed to deny review"
+    fi
     return 0
   fi
 
-  # Author is not a team member, deny the review
+  # Check if author is a direct member of the configured team
+  if is_team_member "$pr_author" "$ORG" "$TEAM"; then
+    echo "  Skipping: Author is a direct member of team ${TEAM}"
+    return 0
+  fi
+
+  # Author is not a team member at all, deny the review
   echo "  Denying review: Author is not a member of team ${TEAM}"
   gh pr review -c -b "$REVIEW_MESSAGE" "$pr_url"
 
