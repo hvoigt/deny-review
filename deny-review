@@ -25,6 +25,10 @@ source ~/.config/deny-review/config
 # Cache for team membership checks
 declare -A TEAM_MEMBERSHIP_CACHE
 
+# Cache for child teams
+CHILD_TEAMS_CACHE=""
+CHILD_TEAMS_LOADED=false
+
 # Function to check if a user is a member of a team
 is_team_member() {
   local username="$1"
@@ -45,6 +49,43 @@ is_team_member() {
   TEAM_MEMBERSHIP_CACHE[$cache_key]=$result
 
   return $result
+}
+
+# Function to get child teams of the configured team
+get_child_teams() {
+  local org="$1"
+  local team="$2"
+
+  if [ "$CHILD_TEAMS_LOADED" = true ]; then
+    echo "$CHILD_TEAMS_CACHE"
+    return
+  fi
+
+  CHILD_TEAMS_CACHE=$(gh api "/orgs/${org}/teams/${team}/teams" --jq '.[].slug' 2>/dev/null)
+  CHILD_TEAMS_LOADED=true
+  echo "$CHILD_TEAMS_CACHE"
+}
+
+# Function to check if a user is a member of any child team
+is_child_team_member() {
+  local username="$1"
+  local org="$2"
+  local team="$3"
+
+  local child_teams
+  child_teams=$(get_child_teams "$org" "$team")
+
+  if [ -z "$child_teams" ]; then
+    return 1
+  fi
+
+  while IFS= read -r child_team; do
+    if is_team_member "$username" "$org" "$child_team"; then
+      return 0
+    fi
+  done <<< "$child_teams"
+
+  return 1
 }
 
 # Function to check if repository is in monitored list
@@ -82,13 +123,26 @@ process_pr() {
     return 0
   fi
 
-  # Check if author is a team member
-  if is_team_member "$pr_author" "$ORG" "$TEAM"; then
-    echo "  Skipping: Author is a member of team ${TEAM}"
+  # Check if author is a member of a child team (deny these too)
+  if is_child_team_member "$pr_author" "$ORG" "$TEAM"; then
+    echo "  Denying review: Author is a member of a child team of ${TEAM}"
+    gh pr review -c -b "$REVIEW_MESSAGE" "$pr_url"
+
+    if [ $? -eq 0 ]; then
+      echo "  ✓ Review denied successfully"
+    else
+      echo "  ✗ Failed to deny review"
+    fi
     return 0
   fi
 
-  # Author is not a team member, deny the review
+  # Check if author is a direct member of the configured team
+  if is_team_member "$pr_author" "$ORG" "$TEAM"; then
+    echo "  Skipping: Author is a direct member of team ${TEAM}"
+    return 0
+  fi
+
+  # Author is not a team member at all, deny the review
   echo "  Denying review: Author is not a member of team ${TEAM}"
   gh pr review -c -b "$REVIEW_MESSAGE" "$pr_url"
 
